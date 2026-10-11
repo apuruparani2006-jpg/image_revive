@@ -1,387 +1,351 @@
-
-import io
-import json
 import os
-import urllib.request
-from pathlib import Path
-
-import cv2
-import numpy as np
+import json
+import io
 import streamlit as st
 from PIL import Image
+from google import genai
 
-try:
-    from google import genai
-except ImportError:
-    genai = None
-
+# --------------------------------------------------
+# PAGE CONFIGURATION
+# --------------------------------------------------
 
 st.set_page_config(
-    page_title="Pixel Revive AI",
-    page_icon="🖼️",
-    layout="wide",
+    page_title="Logic Diagram AI Tutor",
+    page_icon="🔌",
+    layout="wide"
 )
 
-MODEL_DIR = Path("models")
-MODEL_DIR.mkdir(exist_ok=True)
+st.title("🔌 Logic Diagram AI Tutor")
+st.write(
+    "Upload a logic diagram, circuit image, truth table, "
+    "or handwritten digital-logic question. The AI agent "
+    "analyzes it and explains the circuit, Verilog HDL, "
+    "and 8086 assembly where appropriate."
+)
 
-# Corrected configuration and cluster-point locations.
-# The large model weights use a direct-download link.
-MODEL_URLS = {
-    "prototxt": (
-        "https://raw.githubusercontent.com/richzhang/"
-        "colorization/master/colorization/models/"
-        "colorization_deploy_v2.prototxt"
-    ),
-    "points": (
-        "https://github.com/richzhang/colorization/blob/"
-        "master/colorization/resources/pts_in_hull.npy?raw=true"
-    ),
-    "weights": (
-        "https://www.dropbox.com/s/dx0qvhhp5hbcx7z/"
-        "colorization_release_v2.caffemodel?dl=1"
-    ),
-}
+# --------------------------------------------------
+# API CONFIGURATION
+# --------------------------------------------------
 
-
-def setting(name, default=""):
+def get_setting(name, default=""):
     try:
         value = st.secrets.get(name, "")
         if value:
             return value
     except Exception:
         pass
-    return os.getenv(name, default)
+
+    return os.environ.get(name, default)
 
 
-def image_stats(image):
-    rgb = np.asarray(image.convert("RGB"))
-    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+def get_gemini_client():
+    api_key = get_setting("GEMINI_API_KEY")
 
-    return {
-        "width": int(rgb.shape[1]),
-        "height": int(rgb.shape[0]),
-        "saturation": float(np.mean(hsv[:, :, 1])),
-        "sharpness": float(cv2.Laplacian(
-            gray, cv2.CV_64F
-        ).var()),
-        "contrast": float(np.std(gray)),
-    }
+    if not api_key:
+        raise ValueError(
+            "Gemini API key is missing. Add GEMINI_API_KEY "
+            "to .streamlit/secrets.toml or your environment."
+        )
+
+    return genai.Client(api_key=api_key)
 
 
-def plan_restoration(image):
-    s = image_stats(image)
-    plan = {
-        "colorize": s["saturation"] < 12,
-        "denoise": True,
-        "sharpen": s["sharpness"] < 180,
-        "reason": "Local image-statistics fallback.",
-        "planner": "Local fallback",
-    }
+def get_model_name():
+    return get_setting(
+        "GEMINI_MODEL",
+        "gemini-3.8-flash"
+    )
 
-    key = setting("GEMINI_API_KEY")
-    if not key or genai is None:
-        plan["reason"] += " Gemini is not configured."
-        return plan
 
-    model = setting("GEMINI_MODEL", "gemini-2.5-flash")
-    prompt = f"""
-You are the planning agent for a photo restoration app.
+# --------------------------------------------------
+# AGENT INSTRUCTIONS
+# --------------------------------------------------
 
-Image statistics: {json.dumps(s)}
+SYSTEM_PROMPT = """
+You are Logic Diagram AI Tutor, a careful AI agent specializing
+in digital logic, Verilog HDL, and Intel 8086 assembly.
 
-Return ONLY JSON with boolean fields:
-colorize, denoise, sharpen
-and a string field reason.
+The user uploads an image. Analyze the actual image before
+answering. Do not assume every image is a logic circuit.
 
-Colorize grayscale photos only.
-Denoise noisy or aged images.
-Sharpen only if the image is soft.
-Do not claim you have inspected details you cannot verify.
+Follow these sections in your response.
+
+## 1. IMAGE ANALYSIS
+- Identify the type of image.
+- Describe the visible symbols, gates, components, labels,
+  inputs, outputs, and wire connections.
+- Distinguish visible facts from assumptions.
+- If a wire or symbol is unclear, explicitly say so.
+- Never invent a connection just to complete the answer.
+
+## 2. CIRCUIT IDENTIFICATION
+- Explain what the circuit appears to be.
+- Identify whether it is combinational logic, sequential
+  logic, a processor-related diagram, or something else.
+- Explain the practical purpose of the circuit.
+- State the Boolean expression when it can be determined.
+
+## 3. TRUTH TABLE
+- Create a truth table when the available information allows it.
+- Explain how the output is calculated for each input combination.
+- For large circuits, use representative examples if a full
+  truth table would be impractical.
+- Do not invent unknown inputs or outputs.
+
+## 4. VERILOG HDL
+- Explain whether Verilog is appropriate for this image.
+- When sufficient information is available, generate a complete
+  synthesizable Verilog module for the inferred digital circuit.
+- Include module name, input and output declarations, and logic.
+- Use appropriate bit widths.
+- Explain the code line by line.
+- For sequential circuits, identify clock, reset, and state
+  assumptions. Do not silently invent timing behavior.
+
+## 5. INTEL 8086 ASSEMBLY
+- Explain whether the logic can be represented by an 8086 program.
+- When appropriate, generate an 8086-compatible assembly example
+  that calculates the same Boolean function in software.
+- State the assembler and input/output assumptions.
+- Prefer widely supported 8086 instructions.
+- Explain every instruction and show sample register values.
+- Do not claim that assembly creates physical hardware.
+- For sequential circuits, explain which timing or hardware
+  behavior the software example does not model.
+
+For simple combinational circuits, you may use this convention:
+AL contains the packed input bits, BL receives the result,
+unless another convention is more suitable. Clearly define
+which bit of AL corresponds to each named input.
+
+## 6. WORKING EXAMPLE
+- Walk through at least one input example.
+- Show how the circuit produces its output.
+- Show how the Verilog and assembly represent that behavior.
+
+## 7. FINAL COMPARISON
+Compare:
+- What the real circuit does
+- What the Verilog describes
+- What the 8086 program calculates
+- Any assumptions or limitations
+
+## 8. CONFIDENCE AND VALIDATION
+- List uncertain symbols or connections.
+- Suggest what needs to be confirmed.
+- Never claim code was compiled, simulated, or tested unless
+  that actually happened.
+
+If the image is unrelated to digital logic, explain what it
+appears to show and why Verilog or 8086 might not apply.
+
+Use beginner-friendly explanations, headings, tables, and
+separate code fences for Verilog and assembly.
+Be accurate rather than forcing an answer.
 """
 
-    try:
-        client = genai.Client(api_key=key)
-        response = client.models.generate_content(
-            model=model,
-            contents=[prompt, image.convert("RGB")],
-            config={"response_mime_type": "application/json"},
+
+# --------------------------------------------------
+# AGENT: ANALYZE IMAGE
+# --------------------------------------------------
+
+def analyze_image(image, user_question, output_mode):
+    client = get_gemini_client()
+    model = get_model_name()
+
+    prompt = f"""
+{SYSTEM_PROMPT}
+
+USER'S ADDITIONAL QUESTION:
+{user_question or "No additional question."}
+
+OUTPUT PREFERENCE:
+{output_mode}
+
+Analyze the attached image and follow the instructions.
+If the image does not contain enough information to produce
+reliable code, explain what is missing and provide code only
+for the parts that can be inferred safely.
+"""
+
+    response = client.models.generate_content(
+        model=model,
+        contents=[
+            prompt,
+            image.convert("RGB")
+        ]
+    )
+
+    answer = getattr(response, "text", None)
+
+    if not answer:
+        raise RuntimeError(
+            "The AI returned an empty answer. Try again with "
+            "a clearer image or a different supported model."
         )
-        decision = json.loads(response.text or "{}")
 
-        for field in ("colorize", "denoise", "sharpen"):
-            if not isinstance(decision.get(field), bool):
-                raise ValueError(f"Invalid agent decision: {field}")
-
-        decision["reason"] = str(decision.get("reason", "No reason given"))
-        decision["planner"] = f"Gemini ({model})"
-        return decision
-
-    except Exception as exc:
-        plan["reason"] += f" Gemini planning failed: {exc}"
-        return plan
+    return answer
 
 
-def download_model(name):
-    destination = MODEL_DIR / name
-    if destination.exists() and destination.stat().st_size > 1000:
-        return destination
+# --------------------------------------------------
+# OPTIONAL: STRUCTURED CIRCUIT SUMMARY
+# --------------------------------------------------
 
-    url = MODEL_URLS[name]
-    temporary = destination.with_suffix(destination.suffix + ".tmp")
+def extract_summary(answer):
+    """
+    A lightweight local helper. It does not pretend to verify
+    the AI's interpretation; it simply keeps the full response
+    available for display and export.
+    """
+    return {
+        "analysis": answer,
+        "generated_by": "Gemini vision model",
+        "verified_by_simulator": False
+    }
 
+
+# --------------------------------------------------
+# SIDEBAR
+# --------------------------------------------------
+
+with st.sidebar:
+    st.header("Agent settings")
+
+    st.write(
+        "The agent inspects the image and generates an explanation "
+        "and code based on what it can identify."
+    )
+
+    output_mode = st.selectbox(
+        "Explanation mode",
+        [
+            "Full analysis: circuit, truth table, Verilog and 8086",
+            "Focus on Verilog HDL",
+            "Focus on 8086 assembly",
+            "Focus on circuit identification and truth table"
+        ]
+    )
+
+    st.info(
+        "Generated code is a starting point. Verify the circuit "
+        "and test code in the appropriate simulator or assembler."
+    )
+
+    st.caption(
+        "Model: " + get_model_name()
+    )
+
+
+# --------------------------------------------------
+# MAIN INTERFACE
+# --------------------------------------------------
+
+uploaded_file = st.file_uploader(
+    "Upload a circuit or logic image",
+    type=["png", "jpg", "jpeg", "webp"],
+    help=(
+        "Use a clear image with readable gate symbols, "
+        "labels, truth tables, and connections."
+    )
+)
+
+user_question = st.text_area(
+    "What would you like to know? (optional)",
+    placeholder=(
+        "Example: Identify this circuit, derive its Boolean "
+        "expression, and generate Verilog and 8086 code."
+    )
+)
+
+
+if uploaded_file is not None:
     try:
-        request = urllib.request.Request(
-            url,
-            headers={"User-Agent": "PixelReviveAI/1.0"},
+        image = Image.open(uploaded_file).convert("RGB")
+
+        st.subheader("Uploaded image")
+        st.image(
+            image,
+            caption=uploaded_file.name,
+            use_container_width=True
         )
 
-        with urllib.request.urlopen(request, timeout=180) as response:
-            with open(temporary, "wb") as file:
-                while True:
-                    chunk = response.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    file.write(chunk)
+        analyze_button = st.button(
+            "🧠 Analyze with AI agent",
+            type="primary",
+            use_container_width=True
+        )
 
-        if temporary.stat().st_size < 1000:
-            raise RuntimeError(
-                f"Downloaded file {name} is too small or invalid."
+        if analyze_button:
+            with st.spinner(
+                "The agent is inspecting the image and preparing "
+                "the circuit explanation and code..."
+            ):
+                try:
+                    answer = analyze_image(
+                        image,
+                        user_question,
+                        output_mode
+                    )
+
+                    result = extract_summary(answer)
+
+                    st.session_state["analysis_result"] = result
+                    st.session_state["analysis_filename"] = (
+                        uploaded_file.name
+                    )
+
+                except Exception as error:
+                    st.error(
+                        "The analysis could not be completed."
+                    )
+                    st.code(str(error))
+
+        result = st.session_state.get("analysis_result")
+
+        if (
+            result
+            and st.session_state.get("analysis_filename")
+            == uploaded_file.name
+        ):
+            st.divider()
+            st.header("📘 Agent analysis")
+
+            st.markdown(result["analysis"])
+
+            st.download_button(
+                label="⬇️ Download complete explanation",
+                data=result["analysis"],
+                file_name="logic_diagram_analysis.md",
+                mime="text/markdown",
+                use_container_width=True
             )
 
-        temporary.replace(destination)
-        return destination
-
-    except Exception as exc:
-        raise RuntimeError(
-            f"Download failed for '{name}'. URL: {url}. "
-            f"Details: {exc}"
-        ) from exc
-
-    finally:
-        if temporary.exists():
-            temporary.unlink()
-
-
-@st.cache_resource
-def load_colorization_model():
-    proto = download_model("prototxt")
-    points_path = download_model("points")
-    weights = download_model("weights")
-
-    net = cv2.dnn.readNetFromCaffe(str(proto), str(weights))
-    points = np.load(str(points_path), allow_pickle=False)
-
-    if points.shape != (313, 2):
-        raise RuntimeError(
-            f"Unexpected cluster-points shape: {points.shape}"
-        )
-
-    points = points.transpose().reshape(2, 313, 1, 1)
-    net.getLayer(net.getLayerId("class8_ab")).blobs = [
-        points.astype(np.float32)
-    ]
-    net.getLayer(net.getLayerId("conv8_313_rh")).blobs = [
-        np.full((1, 313), 2.606, dtype=np.float32)
-    ]
-    return net
-
-
-def colorize_photo(image):
-    net = load_colorization_model()
-
-    rgb = np.asarray(image.convert("RGB"))
-    height, width = rgb.shape[:2]
-
-    # Convert to RGB Lab so lightness is preserved.
-    rgb_float = rgb.astype(np.float32) / 255.0
-    lab = cv2.cvtColor(rgb_float, cv2.COLOR_RGB2LAB)
-    lightness = lab[:, :, 0]
-
-    resized_l = cv2.resize(
-        lightness, (224, 224), interpolation=cv2.INTER_AREA
-    )
-    resized_l -= 50
-
-    blob = cv2.dnn.blobFromImage(resized_l)
-    net.setInput(blob)
-    ab = net.forward("class8_ab")[0].transpose(1, 2, 0)
-    ab = cv2.resize(ab, (width, height), interpolation=cv2.INTER_CUBIC)
-
-    output_lab = np.concatenate(
-        [lightness[:, :, None], ab], axis=2
-    )
-    output_rgb = cv2.cvtColor(output_lab, cv2.COLOR_LAB2RGB)
-    output_rgb = np.clip(output_rgb, 0, 1)
-
-    return Image.fromarray(
-        (output_rgb * 255).astype(np.uint8)
-    )
-
-
-def denoise_photo(image):
-    bgr = cv2.cvtColor(
-        np.asarray(image.convert("RGB")), cv2.COLOR_RGB2BGR
-    )
-    output = cv2.fastNlMeansDenoisingColored(
-        bgr, None, 4, 4, 7, 21
-    )
-    return Image.fromarray(cv2.cvtColor(output, cv2.COLOR_BGR2RGB))
-
-
-def sharpen_photo(image):
-    rgb = np.asarray(image.convert("RGB"))
-    blur = cv2.GaussianBlur(rgb, (0, 0), 1.0)
-    output = cv2.addWeighted(rgb, 1.12, blur, -0.12, 0)
-    return Image.fromarray(output)
-
-
-def check_quality(original, result, colorization_requested):
-    before = image_stats(original)
-    after = image_stats(result)
-    issues = []
-
-    if original.size != result.size:
-        issues.append("Output dimensions changed.")
-
-    if colorization_requested and after["saturation"] < 8:
-        issues.append("Output is still almost grayscale.")
-
-    if after["sharpness"] < before["sharpness"] * 0.2:
-        issues.append("Output became substantially softer.")
-
-    if not issues:
-        issues.append("Basic statistical checks passed; inspect visually.")
-
-    return issues, after
-
-
-def restore_photo(original):
-    decision = plan_restoration(original)
-    result = original.convert("RGB")
-    log = []
-
-    if decision["colorize"]:
-        result = colorize_photo(result)
-        log.append("Colorization executed.")
-    else:
-        log.append("Colorization skipped: photo appears to contain color.")
-
-    if decision["denoise"]:
-        result = denoise_photo(result)
-        log.append("Denoising executed.")
-
-    if decision["sharpen"]:
-        result = sharpen_photo(result)
-        log.append("Sharpening executed.")
-
-    checks, stats = check_quality(
-        original, result, decision["colorize"]
-    )
-    retried = False
-
-    if decision["colorize"] and stats["saturation"] < 8:
-        retried = True
-        log.append("Quality check failed; retrying colorization once.")
-        result = colorize_photo(original)
-
-        if decision["denoise"]:
-            result = denoise_photo(result)
-
-        checks, stats = check_quality(original, result, True)
-
-    return result, decision, log, checks, stats, retried
-
-
-st.title("🖼️ Pixel Revive AI")
-st.write(
-    "Automatic photo restoration with agent-selected tools, "
-    "quality checks, and retry logic."
-)
-
-uploaded = st.file_uploader(
-    "Upload a black-and-white or damaged color photo",
-    type=["jpg", "jpeg", "png", "webp"],
-)
-
-if uploaded:
-    try:
-        original = Image.open(uploaded).convert("RGB")
-    except Exception as exc:
-        st.error(f"Could not read this image: {exc}")
-        st.stop()
-
-    upload_id = f"{uploaded.name}:{uploaded.size}"
-    if st.session_state.get("upload_id") != upload_id:
-        st.session_state["upload_id"] = upload_id
-        for key in (
-            "result", "decision", "log",
-            "checks", "stats", "retried"
-        ):
-            st.session_state.pop(key, None)
-
-    st.subheader("Original photo")
-    st.image(original, use_container_width=True)
-
-    if st.button("Restore photo automatically", type="primary"):
-        with st.spinner(
-            "Agent is planning tools and restoring your photo..."
-        ):
-            try:
-                result, decision, log, checks, stats, retried = (
-                    restore_photo(original)
+            with st.expander("About this result"):
+                st.write(
+                    "AI-generated interpretation. It has not been "
+                    "independently verified by a circuit simulator."
                 )
-                st.session_state["result"] = result
-                st.session_state["decision"] = decision
-                st.session_state["log"] = log
-                st.session_state["checks"] = checks
-                st.session_state["stats"] = stats
-                st.session_state["retried"] = retried
-            except Exception as exc:
-                st.error(str(exc))
 
-    result = st.session_state.get("result")
-    if result is not None:
-        left, right = st.columns(2)
+    except Exception as error:
+        st.error("Could not open the uploaded image.")
+        st.code(str(error))
 
-        with left:
-            st.subheader("Original")
-            st.image(original, use_container_width=True)
+else:
+    st.info(
+        "Upload an image to start. You can use a logic-gate "
+        "diagram, digital circuit, truth table, or handwritten "
+        "digital-logic question."
+    )
 
-        with right:
-            st.subheader("Restored")
-            st.image(result, use_container_width=True)
 
-        buffer = io.BytesIO()
-        result.save(buffer, format="PNG")
+# --------------------------------------------------
+# FOOTER
+# --------------------------------------------------
 
-        st.download_button(
-            "Download restored photo",
-            data=buffer.getvalue(),
-            file_name="pixel_revive_restored.png",
-            mime="image/png",
-        )
-
-        with st.expander("Agent decisions and quality report", expanded=True):
-            decision = st.session_state["decision"]
-            st.write("**Planner:**", decision["planner"])
-            st.write("**Reason:**", decision["reason"])
-
-            st.write("**Tool log**")
-            for line in st.session_state["log"]:
-                st.write("- " + line)
-
-            st.write("**Quality checks**")
-            for line in st.session_state["checks"]:
-                st.write("- " + line)
-
-            st.write("**Output statistics**", st.session_state["stats"])
-
-            if st.session_state["retried"]:
-                st.info("Colorization was retried once.")
+st.divider()
 
 st.caption(
-    "Colorization estimates plausible colors, not exact historical colors. "
-    "This version does not perform advanced scratch reconstruction."
+    "Logic Diagram AI Tutor | Verilog describes hardware; "
+    "8086 assembly performs software calculations. "
+    "AI-generated interpretations and code should be verified."
 )
