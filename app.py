@@ -1,6 +1,9 @@
 
 import io
+import json
 import os
+import urllib.request
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -9,14 +12,8 @@ from PIL import Image
 
 try:
     from google import genai
-    GEMINI_AVAILABLE = True
 except ImportError:
-    GEMINI_AVAILABLE = False
-
-
-# --------------------------------------------------
-# PAGE CONFIGURATION
-# --------------------------------------------------
+    genai = None
 
 st.set_page_config(
     page_title="Pixel Revive AI",
@@ -24,335 +21,286 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🖼️ Pixel Revive AI")
-st.write(
-    "Enhance old photos and use an AI agent to explain "
-    "images, Verilog HDL, and 8086 assembly code."
-)
+MODEL_DIR = Path(__file__).parent / "models"
+MODEL_DIR.mkdir(exist_ok=True)
+
+MODEL_URLS = {
+    "prototxt": "https://raw.githubusercontent.com/richzhang/colorization/caffe/colorization/models/colorization_deploy_v2.prototxt",
+    "points": "https://raw.githubusercontent.com/richzhang/colorization/caffe/colorization/resources/pts_in_hull.npy",
+    "weights": "https://github.com/richzhang/colorization/raw/caffe/colorization_release_v2.caffemodel",
+}
 
 
-# --------------------------------------------------
-# GEMINI CONFIGURATION
-# --------------------------------------------------
-
-MODEL_NAME = "gemini-3.8-flash"
-
-
-def get_api_key():
-    """Read the API key from Streamlit secrets or environment."""
+def setting(name, default=""):
     try:
-        key = st.secrets.get("GEMINI_API_KEY", "")
-        if key:
-            return key
+        value = st.secrets.get(name, "")
+        if value:
+            return value
     except Exception:
         pass
+    return os.getenv(name, default)
 
-    return os.environ.get("GEMINI_API_KEY", "")
+
+def stats(image):
+    rgb = np.asarray(image.convert("RGB"))
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    return {
+        "width": int(rgb.shape[1]),
+        "height": int(rgb.shape[0]),
+        "saturation": float(np.mean(hsv[:, :, 1])),
+        "sharpness": float(cv2.Laplacian(gray, cv2.CV_64F).var()),
+    }
 
 
-def ask_agent(prompt, image=None):
-    """Ask Gemini to generate an answer for the current task."""
-    if not GEMINI_AVAILABLE:
-        return (
-            "The Google Gen AI package is missing. "
-            "Run: pip install --upgrade google-genai"
+def plan(image):
+    s = stats(image)
+    fallback = {
+        "colorize": s["saturation"] < 12,
+        "denoise": True,
+        "sharpen": s["sharpness"] < 180,
+        "reason": "Local image-statistics fallback",
+        "planner": "Local fallback",
+    }
+
+    key = setting("GEMINI_API_KEY")
+    if not key or genai is None:
+        fallback["reason"] += (
+            "; Gemini key/SDK unavailable, so automatic local planning was used."
         )
+        return fallback
 
-    api_key = get_api_key()
-    if not api_key:
-        return (
-            "API key not found. Add GEMINI_API_KEY to "
-            ".streamlit/secrets.toml and restart the app."
-        )
+    model = setting("GEMINI_MODEL", "gemini-2.5-flash")
+    prompt = f"""
+You are a photo restoration planning agent.
+Image statistics: {json.dumps(s)}
+Return only JSON with boolean fields colorize, denoise, sharpen,
+and a short string reason.
+Colorize only if grayscale. Denoise old/noisy images.
+Sharpen only if soft. Be conservative. Do not recommend aggressive
+scratch removal because it may destroy facial features.
+"""
 
     try:
-        client = genai.Client(api_key=api_key)
-
-        contents = [prompt]
-        if image is not None:
-            contents.append(image.convert("RGB"))
-
+        client = genai.Client(api_key=key)
         response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=contents,
+            model=model,
+            contents=[prompt, image.convert("RGB")],
+            config={"response_mime_type": "application/json"},
         )
-
-        answer = response.text
-        if not answer:
-            return "The AI returned no text. Please try again."
-
-        return answer
-
+        decision = json.loads(response.text or "{}")
+        for field in ("colorize", "denoise", "sharpen"):
+            if not isinstance(decision.get(field), bool):
+                raise ValueError(f"Invalid agent decision: {field}")
+        decision["reason"] = str(decision.get("reason", "No reason provided"))
+        decision["planner"] = f"Gemini ({model})"
+        return decision
     except Exception as exc:
-        return (
-            "The Gemini request failed.\n\n"
-            f"Error: {exc}\n\n"
-            "Check your API key, internet connection, model "
-            "availability, and API access."
-        )
+        fallback["reason"] += f"; Gemini failed, using fallback: {exc}"
+        return fallback
 
 
-# --------------------------------------------------
-# IMAGE ENHANCEMENT
-# --------------------------------------------------
-
-def enhance_photo(pil_image, denoise_strength=5,
-                  contrast=1.08, brightness=1.02):
-    """
-    Perform conservative image enhancement.
-
-    This function does not automatically erase scratches.
-    That is intentional: an automatic scratch mask can
-    mistake eyes, hair, skin texture, and other details
-    for damage.
-    """
-    rgb = np.array(pil_image.convert("RGB"))
-    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-
-    # Gentle denoising; keep the original image dimensions.
-    denoised = cv2.fastNlMeansDenoisingColored(
-        bgr,
-        None,
-        h=denoise_strength,
-        hColor=denoise_strength,
-        templateWindowSize=7,
-        searchWindowSize=21,
-    )
-
-    # Adjust contrast and brightness.
-    adjusted = cv2.convertScaleAbs(
-        denoised,
-        alpha=contrast,
-        beta=(brightness - 1.0) * 255,
-    )
-
-    # Mild sharpening, avoiding aggressive edge enhancement.
-    blurred = cv2.GaussianBlur(adjusted, (0, 0), 1.0)
-    sharpened = cv2.addWeighted(
-        adjusted, 1.15, blurred, -0.15, 0
-    )
-
-    output_rgb = cv2.cvtColor(
-        sharpened, cv2.COLOR_BGR2RGB
-    )
-    return Image.fromarray(output_rgb)
-
-
-# --------------------------------------------------
-# PHOTO RESTORATION INTERFACE
-# --------------------------------------------------
-
-st.header("1. Photo Enhancement")
-
-uploaded_photo = st.file_uploader(
-    "Upload an old or damaged photo",
-    type=["png", "jpg", "jpeg", "webp"],
-    key="photo_uploader",
-)
-
-if uploaded_photo is not None:
+def download(url, path):
+    if path.exists() and path.stat().st_size > 1000:
+        return
+    temp = path.with_suffix(path.suffix + ".tmp")
     try:
-        original = Image.open(uploaded_photo).convert("RGB")
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "PixelReviveAI"}
+        )
+        with urllib.request.urlopen(req, timeout=120) as response:
+            with open(temp, "wb") as f:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+        if temp.stat().st_size < 1000:
+            raise RuntimeError(f"Invalid model download: {path.name}")
+        temp.replace(path)
+    finally:
+        if temp.exists():
+            temp.unlink()
 
-        st.subheader("Enhancement settings")
-        col_a, col_b, col_c = st.columns(3)
 
-        with col_a:
-            denoise = st.slider(
-                "Denoising", 0, 15, 5
-            )
+def colorize(image):
+    proto = MODEL_DIR / "colorization_deploy_v2.prototxt"
+    points_file = MODEL_DIR / "pts_in_hull.npy"
+    weights = MODEL_DIR / "colorization_release_v2.caffemodel"
 
-        with col_b:
-            contrast = st.slider(
-                "Contrast", 0.80, 1.40, 1.08, 0.01
-            )
+    download(MODEL_URLS["prototxt"], proto)
+    download(MODEL_URLS["points"], points_file)
+    download(MODEL_URLS["weights"], weights)
 
-        with col_c:
-            brightness = st.slider(
-                "Brightness", 0.80, 1.30, 1.02, 0.01
-            )
+    net = cv2.dnn.readNetFromCaffe(str(proto), str(weights))
+    points = np.load(str(points_file)).transpose().reshape(2, 313, 1, 1)
+    net.getLayer(net.getLayerId("class8_ab")).blobs = [
+        points.astype(np.float32)
+    ]
+    net.getLayer(net.getLayerId("conv8_313_rh")).blobs = [
+        np.full((1, 313), 2.606, dtype=np.float32)
+    ]
 
-        if st.button("Enhance Photo", type="primary"):
-            with st.spinner("Enhancing your photo..."):
-                result = enhance_photo(
-                    original,
-                    denoise_strength=denoise,
-                    contrast=contrast,
-                    brightness=brightness,
+    rgb = np.asarray(image.convert("RGB"))
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    h, w = bgr.shape[:2]
+    normalized = bgr.astype(np.float32) / 255.0
+    lab = cv2.cvtColor(normalized, cv2.COLOR_BGR2LAB)
+
+    blob = cv2.dnn.blobFromImage(
+        normalized, 1.0, (224, 224), (50, 50, 50),
+        swapRB=False, crop=False
+    )
+    net.setInput(blob)
+    ab = net.forward("class8_ab")[0].transpose(1, 2, 0)
+    ab = cv2.resize(ab, (w, h), interpolation=cv2.INTER_CUBIC)
+
+    output_lab = np.concatenate([lab[:, :, 0, None], ab], axis=2)
+    output = cv2.cvtColor(output_lab, cv2.COLOR_LAB2BGR)
+    output = np.clip(output, 0, 1)
+    output = cv2.cvtColor(
+        (output * 255).astype(np.uint8), cv2.COLOR_BGR2RGB
+    )
+    return Image.fromarray(output)
+
+
+def denoise(image):
+    bgr = cv2.cvtColor(np.asarray(image.convert("RGB")), cv2.COLOR_RGB2BGR)
+    result = cv2.fastNlMeansDenoisingColored(
+        bgr, None, 4, 4, 7, 21
+    )
+    return Image.fromarray(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
+
+
+def sharpen(image):
+    bgr = cv2.cvtColor(np.asarray(image.convert("RGB")), cv2.COLOR_RGB2BGR)
+    blur = cv2.GaussianBlur(bgr, (0, 0), 1.0)
+    result = cv2.addWeighted(bgr, 1.12, blur, -0.12, 0)
+    return Image.fromarray(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
+
+
+def quality_check(original, result, should_colorize):
+    s = stats(result)
+    issues = []
+    if result.size != original.size:
+        issues.append("Image dimensions changed.")
+    if should_colorize and s["saturation"] < 8:
+        issues.append("Output remains nearly grayscale.")
+    if not issues:
+        issues.append("Basic checks passed; visually inspect the result.")
+    return issues, s
+
+
+def restore(original):
+    decision = plan(original)
+    result = original.convert("RGB")
+    log = []
+
+    if decision["colorize"]:
+        result = colorize(result)
+        log.append("Colorization executed")
+    else:
+        log.append("Colorization skipped: image already has color")
+
+    if decision["denoise"]:
+        result = denoise(result)
+        log.append("Denoising executed")
+
+    if decision["sharpen"]:
+        result = sharpen(result)
+        log.append("Sharpening executed")
+
+    checks, output_stats = quality_check(
+        original, result, decision["colorize"]
+    )
+    retried = False
+
+    # One retry from the original if colorization remains nearly grayscale.
+    if decision["colorize"] and output_stats["saturation"] < 8:
+        retried = True
+        log.append("Colorization quality check failed; retrying once")
+        result = colorize(original)
+        if decision["denoise"]:
+            result = denoise(result)
+        checks, output_stats = quality_check(
+            original, result, decision["colorize"]
+        )
+
+    return result, decision, log, checks, output_stats, retried
+
+
+st.title("🖼️ Pixel Revive AI")
+st.write(
+    "Automatically plan and run photo restoration tools, check the output, "
+    "and download the result."
+)
+
+uploaded = st.file_uploader(
+    "Upload a black-and-white or damaged color photo",
+    type=["jpg", "jpeg", "png", "webp"],
+)
+
+if uploaded:
+    original = Image.open(uploaded).convert("RGB")
+    upload_id = f"{uploaded.name}-{uploaded.size}"
+
+    if st.session_state.get("upload_id") != upload_id:
+        st.session_state["upload_id"] = upload_id
+        for key in ("result", "decision", "log", "checks", "output_stats", "retried"):
+            st.session_state.pop(key, None)
+
+    st.subheader("Original photograph")
+    st.image(original, use_container_width=True)
+
+    if st.button("Restore photo automatically", type="primary"):
+        with st.spinner("Agent is analyzing and restoring your photo..."):
+            try:
+                result, decision, log, checks, output_stats, retried = restore(original)
+                st.session_state["result"] = result
+                st.session_state["decision"] = decision
+                st.session_state["log"] = log
+                st.session_state["checks"] = checks
+                st.session_state["output_stats"] = output_stats
+                st.session_state["retried"] = retried
+            except Exception as exc:
+                st.error(
+                    "Restoration failed. Check internet access for the first "
+                    f"model download, then try again.\n\nDetails: {exc}"
                 )
-                st.session_state["enhanced_photo"] = result
 
-        result = st.session_state.get("enhanced_photo")
+    result = st.session_state.get("result")
+    if result is not None:
+        left, right = st.columns(2)
+        with left:
+            st.subheader("Original")
+            st.image(original, use_container_width=True)
+        with right:
+            st.subheader("Restored")
+            st.image(result, use_container_width=True)
 
-        if result is not None:
-            left, right = st.columns(2)
+        buffer = io.BytesIO()
+        result.save(buffer, format="PNG")
+        st.download_button(
+            "Download restored photo",
+            data=buffer.getvalue(),
+            file_name="pixel_revive_restored.png",
+            mime="image/png",
+        )
 
-            with left:
-                st.subheader("Original")
-                st.image(original, use_container_width=True)
+        with st.expander("Agent plan and quality report", expanded=True):
+            st.write("**Planner:**", st.session_state["decision"]["planner"])
+            st.write("**Reason:**", st.session_state["decision"]["reason"])
+            st.write("**Tool log:**")
+            for line in st.session_state["log"]:
+                st.write("- " + line)
+            st.write("**Quality checks:**")
+            for line in st.session_state["checks"]:
+                st.write("- " + line)
+            if st.session_state["retried"]:
+                st.info("The agent retried colorization once.")
 
-            with right:
-                st.subheader("Enhanced")
-                st.image(result, use_container_width=True)
-
-            buffer = io.BytesIO()
-            result.save(buffer, format="PNG")
-
-            st.download_button(
-                "Download Enhanced Photo",
-                data=buffer.getvalue(),
-                file_name="pixel_revive_enhanced.png",
-                mime="image/png",
-            )
-        else:
-            st.image(
-                original,
-                caption="Uploaded photo",
-                use_container_width=True,
-            )
-
-    except Exception as exc:
-        st.error(f"Could not open this image: {exc}")
-
-
-# --------------------------------------------------
-# AI AGENT: IMAGE ANALYSIS
-# --------------------------------------------------
-
-st.divider()
-st.header("2. AI Agent — Image Analysis")
-
-if uploaded_photo is not None:
-    if st.button("Analyze Uploaded Photo"):
-        try:
-            photo_for_ai = Image.open(
-                uploaded_photo
-            ).convert("RGB")
-
-            prompt = """
-            Act as a photo restoration assistant.
-            Describe the visible condition of this photo.
-            Identify likely issues such as fading, noise,
-            scratches, blur, or low contrast.
-            Recommend conservative restoration steps.
-            Do not claim to have restored pixels just by
-            describing the image.
-            """
-            with st.spinner("AI is analyzing the photo..."):
-                st.markdown(ask_agent(prompt, photo_for_ai))
-        except Exception as exc:
-            st.error(f"Image analysis failed: {exc}")
-else:
-    st.info("Upload a photo above to enable image analysis.")
-
-
-# --------------------------------------------------
-# AI AGENT: VERILOG EXPLANATION
-# --------------------------------------------------
-
-st.divider()
-st.header("3. AI Agent — Verilog HDL")
-
-default_verilog = """module brightness_adder (
-    input  wire [7:0] pixel,
-    input  wire [7:0] brightness,
-    output wire [7:0] result
-);
-    wire [8:0] sum;
-    assign sum = {1'b0, pixel} + {1'b0, brightness};
-    assign result = sum[8] ? 8'hFF : sum[7:0];
-endmodule
-"""
-
-verilog_code = st.text_area(
-    "Paste your Verilog code",
-    value=default_verilog,
-    height=230,
-    key="verilog_input",
-)
-
-if st.button("Explain Verilog Code", type="primary"):
-    if not verilog_code.strip():
-        st.warning("Please enter some Verilog code first.")
-    else:
-        prompt = f"""
-You are an experienced digital-design tutor.
-Explain the user's actual Verilog code below.
-
-Organize the answer into:
-1. Purpose of the module
-2. Inputs and outputs, including bit widths
-3. Explanation of important statements
-4. How the logic behaves for example inputs
-5. Potential bugs, width issues, or synthesis concerns
-6. A short summary in beginner-friendly language
-
-Be accurate. If something cannot be determined from
-the code, say so. Do not invent signals or behavior.
-
-VERILOG CODE:
-{verilog_code}
-"""
-        with st.spinner("AI agent is reading the Verilog code..."):
-            st.markdown(ask_agent(prompt))
-
-
-# --------------------------------------------------
-# AI AGENT: 8086 ASSEMBLY EXPLANATION
-# --------------------------------------------------
-
-st.divider()
-st.header("4. AI Agent — 8086 Assembly")
-
-default_asm = """; Example only: add a value to AL with saturation
-MOV AL, 100
-MOV BL, 30
-ADD AL, BL
-JNC NO_OVERFLOW
-MOV AL, 255
-NO_OVERFLOW:
-HLT
-"""
-
-asm_code = st.text_area(
-    "Paste your 8086 assembly code",
-    value=default_asm,
-    height=230,
-    key="asm_input",
-)
-
-if st.button("Explain 8086 Code", type="primary"):
-    if not asm_code.strip():
-        st.warning("Please enter some assembly code first.")
-    else:
-        prompt = f"""
-You are an experienced 8086 assembly-language tutor.
-Explain the user's actual code below.
-
-Organize the answer into:
-1. What the program is intended to do
-2. Explanation of each instruction in order
-3. Registers and flags that are affected
-4. A step-by-step trace using the actual instructions
-5. Potential errors or assumptions about assembler syntax
-6. A short beginner-friendly summary
-
-Do not pretend to execute the program. If the intended
-behavior is ambiguous, explain the uncertainty.
-
-8086 ASSEMBLY CODE:
-{asm_code}
-"""
-        with st.spinner("AI agent is reading the assembly code..."):
-            st.markdown(ask_agent(prompt))
-
-
-# --------------------------------------------------
-# FOOTER
-# --------------------------------------------------
-
-st.divider()
 st.caption(
-    "Pixel Revive AI | AI-generated explanations may contain "
-    "errors. Verify code behavior before using it in a project."
+    "Colorization estimates plausible colors, not historically exact colors. "
+    "This version uses conservative enhancement and does not automatically "
+    "erase scratches, because that can damage facial details."
 )
